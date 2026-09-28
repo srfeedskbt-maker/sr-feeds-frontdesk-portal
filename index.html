@@ -1788,6 +1788,40 @@ function getPendingQueue(){
   try{ const q=JSON.parse(localStorage.getItem(LS_QUEUE_KEY)||'[]'); return Array.isArray(q)?q:[]; }catch(e){ return []; }
 }
 function clearPendingQueue(){ localStorage.removeItem(LS_QUEUE_KEY); renderPendingBanner(); }
+function reconcileServerWrite(kind, localRecord, res){
+  if(!res || !res.success || !res.data) return localRecord;
+  const serverRecord = Object.assign({}, res.data);
+  const idField = serverRecord['Customer ID']!=null ? 'Customer ID' :
+                  serverRecord['Quotation ID']!=null ? 'Quotation ID' :
+                  serverRecord['Complaint ID']!=null ? 'Complaint ID' :
+                  serverRecord['Enquiry ID']!=null ? 'Enquiry ID' : null;
+  if(!idField) return localRecord;
+
+  const oldId = localRecord[idField];
+  const newId = serverRecord[idField];
+  Object.keys(localRecord).forEach(k=>delete localRecord[k]);
+  Object.assign(localRecord, serverRecord);
+
+  if(kind==='customerCreate'||kind==='customerUpdate'){
+    const idx=STATE.customers.findIndex(x=>x[idField]===oldId || x[idField]===newId);
+    if(idx>=0) STATE.customers[idx]=Object.assign({},serverRecord);
+  }else if(kind==='chicksEnquiry'){
+    const idx=STATE.chicksEnquiries.findIndex(x=>x[idField]===oldId || x[idField]===newId);
+    if(idx>=0) STATE.chicksEnquiries[idx]=Object.assign({},serverRecord);
+  }else if(kind==='feedEnquiry'){
+    const idx=STATE.feedEnquiries.findIndex(x=>x[idField]===oldId || x[idField]===newId);
+    if(idx>=0) STATE.feedEnquiries[idx]=Object.assign({},serverRecord);
+  }else if(kind==='quotation'){
+    const idx=STATE.allQuotations.findIndex(x=>x[idField]===oldId || x[idField]===newId);
+    if(idx>=0) STATE.allQuotations[idx]=Object.assign({},serverRecord);
+    STATE.sessionQuotations.forEach(q=>{ if(q.id===oldId || q.id===newId) q.id=newId; });
+  }else if(kind==='healthComplaint'){
+    const idx=STATE.healthComplaints.findIndex(x=>x[idField]===oldId || x[idField]===newId);
+    if(idx>=0) STATE.healthComplaints[idx]=Object.assign({},serverRecord);
+  }
+  return localRecord;
+}
+
 function pendingAction(kind){
   return {
     customerCreate:'createCustomer', customerUpdate:'updateCustomer', customer:'createCustomer',
@@ -1805,7 +1839,10 @@ async function retrySync(){
     const action=pendingAction(item.kind);
     if(!action){ remaining.push(item); continue; }
     const res=await apiCall(action,item.record);
-    if(res&&res.success) successCount++; else remaining.push(item);
+    if(res&&res.success){
+      reconcileServerWrite(item.kind,item.record,res);
+      successCount++;
+    } else remaining.push(item);
   }
   localStorage.setItem(LS_QUEUE_KEY,JSON.stringify(remaining));
   await refetchAllData();
@@ -1980,6 +2017,7 @@ document.getElementById('farmerForm').addEventListener('submit', async function(
   btn.disabled = false; btn.textContent = 'Save Customer';
 
   if(res && res.success){
+    reconcileServerWrite(isUpdate ? 'customerUpdate' : 'customerCreate', record, res);
     upsertLocalCustomer(record);
     toast('Customer saved successfully — ' + customerId, 'success');
     this.reset(); clearDraft();
@@ -2105,7 +2143,7 @@ document.getElementById('ck_saveEnquiryBtn').addEventListener('click', async ()=
     'Payment Mode':'', 'Remarks':'', 'Created Date':todayISO(), 'Created By':currentUserName()
   };
   const res = await apiCall('createChicksEnquiry', record);
-  if(res && res.success){ STATE.chicksEnquiries.push(record); toast('Chicks enquiry saved — '+enquiryId,'success'); }
+  if(res && res.success){ reconcileServerWrite('chicksEnquiry',record,res); STATE.chicksEnquiries.push(record); toast('Chicks enquiry saved — '+record['Enquiry ID'],'success'); }
   else { STATE.chicksEnquiries.push(record); queuePendingSync('chicksEnquiry', record); toast('Saved locally — sync pending','warn'); }
   btn.disabled = false;
   renderDashboard();
@@ -2202,7 +2240,7 @@ document.getElementById('fd_saveEnquiryBtn').addEventListener('click', async ()=
     'Payment Mode':'', 'Remarks':'', 'Created Date':todayISO(), 'Created By':currentUserName()
   };
   const res = await apiCall('createFeedEnquiry', record);
-  if(res && res.success){ STATE.feedEnquiries.push(record); toast('Feed enquiry saved — '+enquiryId,'success'); }
+  if(res && res.success){ reconcileServerWrite('feedEnquiry',record,res); STATE.feedEnquiries.push(record); toast('Feed enquiry saved — '+record['Enquiry ID'],'success'); }
   else { STATE.feedEnquiries.push(record); queuePendingSync('feedEnquiry', record); toast('Saved locally — sync pending','warn'); }
   btn.disabled = false;
   renderDashboard();
@@ -2621,7 +2659,8 @@ document.getElementById('qb_generateBtn').addEventListener('click', async functi
     'Delivery Status':'', 'Advance Paid':0, 'Balance Due':calc.finalAmount, 'Created By':currentUserName()
   };
   const res = await apiCall('createQuotation', record);
-  if(!(res && res.success)) queuePendingSync('quotation', record);
+  if(res && res.success) reconcileServerWrite('quotation',record,res);
+  else queuePendingSync('quotation', record);
   STATE.allQuotations.push(record);
 
   renderQuotationPreview(q);
@@ -3427,6 +3466,7 @@ document.getElementById('healthForm').addEventListener('submit', async function(
   const res = await apiCall('createHealthComplaint', record);
   btn.disabled = false; btn.textContent = 'Register Complaint';
 
+  if(res && res.success) reconcileServerWrite('healthComplaint',record,res);
   STATE.healthComplaints.push(record);
   if(!(res && res.success)) queuePendingSync('healthComplaint', record);
   toast((res && res.success ? 'Complaint registered — ' : 'Saved locally, sync pending — ') + complaintId, res && res.success ? 'success' : 'warn');
