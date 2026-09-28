@@ -1486,7 +1486,12 @@ function toast(msg, type){
   setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .3s'; setTimeout(()=>el.remove(),300); }, 3800);
 }
 function nextSeq(list, prefix){
-  return String(list.length + 1).padStart(4,'0');
+  const values=(Array.isArray(list)?list:[]).map(r=>{
+    const id=r && (r['Customer ID']||r['Quotation ID']||r['Complaint ID']||r['Enquiry ID']||r.id||'');
+    const m=String(id).match(/(\d+)$/);
+    return m ? Number(m[1]) : 0;
+  });
+  return String((values.length?Math.max(...values):0)+1).padStart(4,'0');
 }
 
 /* ================================================================
@@ -1661,42 +1666,57 @@ tickClock(); setInterval(tickClock, 60000);
    text/plain POST body to avoid CORS preflight (Apps Script web
    apps do not handle OPTIONS requests).
    ================================================================ */
+const API_TIMEOUT_MS = 20000;
+let syncRevision = 0;
+let syncPromise = null;
+
+async function fetchJson(url, options){
+  const controller = new AbortController();
+  const timer = setTimeout(()=>controller.abort(), API_TIMEOUT_MS);
+  try{
+    const res = await fetch(url, Object.assign({}, options||{}, { signal:controller.signal, cache:'no-store' }));
+    const text = await res.text();
+    let data;
+    try{ data = JSON.parse(text); }
+    catch(e){ throw new Error('Google Apps Script returned a non-JSON response (HTTP '+res.status+')'); }
+    if(!res.ok) throw new Error(data.message || ('HTTP '+res.status));
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
 async function apiCall(action, payload){
   const url = APP_CONFIG.googleAppsScriptUrl;
   if(!url || url === 'PASTE_WEB_APP_URL_HERE'){
     return { success:false, message:'Google Apps Script URL not configured yet. See Settings / README.' };
   }
   try{
-    const res = await fetch(url, {
+    const data = await fetchJson(url, {
       method:'POST',
+      headers:{'Content-Type':'text/plain;charset=utf-8'},
       body: JSON.stringify({ action, payload: payload||{} })
     });
-    const data = await res.json();
-    STATE.connected = true;
-    updateConnPill(true);
+    STATE.connected = true; updateConnPill(true);
     return data;
   }catch(err){
-    STATE.connected = false;
-    updateConnPill(false);
-    return { success:false, message:'Network error contacting Google Sheets: ' + err.message };
+    STATE.connected = false; updateConnPill(false);
+    return { success:false, message:'Network error contacting Google Sheets: ' + (err.name==='AbortError'?'request timed out':err.message) };
   }
 }
+
 async function apiGet(action, params){
   const url = APP_CONFIG.googleAppsScriptUrl;
   if(!url || url === 'PASTE_WEB_APP_URL_HERE'){
     return { success:false, message:'Google Apps Script URL not configured yet.' };
   }
   try{
-    const qs = new URLSearchParams(Object.assign({action}, params||{})).toString();
-    const res = await fetch(url + '?' + qs, { method:'GET' });
-    const data = await res.json();
-    STATE.connected = true;
-    updateConnPill(true);
+    const query = Object.assign({}, params||{}, {_ts:Date.now()});
+    const qs = new URLSearchParams(Object.assign({action}, query)).toString();
+    const data = await fetchJson(url + '?' + qs, { method:'GET' });
+    STATE.connected = true; updateConnPill(true);
     return data;
   }catch(err){
-    STATE.connected = false;
-    updateConnPill(false);
-    return { success:false, message:'Network error contacting Google Sheets: ' + err.message };
+    STATE.connected = false; updateConnPill(false);
+    return { success:false, message:'Network error contacting Google Sheets: ' + (err.name==='AbortError'?'request timed out':err.message) };
   }
 }
 function updateConnPill(ok){
@@ -1756,27 +1776,41 @@ function debounce(fn, ms){ let t; return function(...a){ clearTimeout(t); t=setT
 
 
 function queuePendingSync(kind, record){
-  const q = JSON.parse(localStorage.getItem(LS_QUEUE_KEY) || '[]');
-  q.push({ kind, record, queuedAt: Date.now() });
+  const q = getPendingQueue();
+  const key = record['Customer ID'] || record['Quotation ID'] || record['Complaint ID'] || record['Enquiry ID'];
+  const idx = q.findIndex(x=>x.kind===kind && key && (x.record['Customer ID']||x.record['Quotation ID']||x.record['Complaint ID']||x.record['Enquiry ID'])===key);
+  const item = { kind, record, queuedAt: Date.now() };
+  if(idx>=0) q[idx] = item; else q.push(item);
   localStorage.setItem(LS_QUEUE_KEY, JSON.stringify(q));
-  pendingBannerDismissed = false;
-  renderPendingBanner();
+  pendingBannerDismissed = false; renderPendingBanner();
 }
-function getPendingQueue(){ return JSON.parse(localStorage.getItem(LS_QUEUE_KEY) || '[]'); }
+function getPendingQueue(){
+  try{ const q=JSON.parse(localStorage.getItem(LS_QUEUE_KEY)||'[]'); return Array.isArray(q)?q:[]; }catch(e){ return []; }
+}
 function clearPendingQueue(){ localStorage.removeItem(LS_QUEUE_KEY); renderPendingBanner(); }
+function pendingAction(kind){
+  return {
+    customerCreate:'createCustomer', customerUpdate:'updateCustomer', customer:'createCustomer',
+    chicksEnquiry:'createChicksEnquiry', feedEnquiry:'createFeedEnquiry', quotation:'createQuotation',
+    deleteCustomer:'deleteCustomer', updateQuotationStatus:'updateQuotationStatus',
+    healthComplaint:'createHealthComplaint', healthComplaintUpdate:'updateHealthComplaint',
+    quotationFields:'updateQuotationFields'
+  }[kind];
+}
 async function retrySync(){
   const q = getPendingQueue();
   if(!q.length){ toast('Nothing pending to sync'); return; }
-  let successCount = 0;
-  const remaining = [];
+  let successCount=0; const remaining=[];
   for(const item of q){
-    const actionMap = {customer:'createCustomer', chicksEnquiry:'createChicksEnquiry', feedEnquiry:'createFeedEnquiry', quotation:'createQuotation', deleteCustomer:'deleteCustomer', updateQuotationStatus:'updateQuotationStatus', healthComplaint:'createHealthComplaint', healthComplaintUpdate:'updateHealthComplaint', quotationFields:'updateQuotationFields'};
-    const res = await apiCall(actionMap[item.kind], item.record);
-    if(res && res.success) successCount++; else remaining.push(item);
+    const action=pendingAction(item.kind);
+    if(!action){ remaining.push(item); continue; }
+    const res=await apiCall(action,item.record);
+    if(res&&res.success) successCount++; else remaining.push(item);
   }
-  localStorage.setItem(LS_QUEUE_KEY, JSON.stringify(remaining));
+  localStorage.setItem(LS_QUEUE_KEY,JSON.stringify(remaining));
+  await refetchAllData();
   renderPendingBanner();
-  toast(`Synced ${successCount} of ${q.length} pending record(s)`, successCount===q.length?'success':'warn');
+  toast(`Synced ${successCount} of ${q.length} pending record(s)`,successCount===q.length?'success':'warn');
 }
 let pendingBannerDismissed = false;
 function renderPendingBanner(){
@@ -1808,18 +1842,23 @@ function dismissPendingBanner(){
 function val(id){ const el=document.getElementById(id); return el ? el.value.trim() : ''; }
 function setVal(id, v){ const el=document.getElementById(id); if(el && v!=null) el.value = v; }
 
+function normalizeMobile(v){ return String(v||'').replace(/\D/g,'').slice(-10); }
+function normalizeText(v){ return String(v||'').toLowerCase().trim(); }
 function findCustomerByMobile(mobile){
-  return STATE.customers.find(c => c.Mobile === mobile);
+  const m=normalizeMobile(mobile);
+  return STATE.customers.find(c=>normalizeMobile(c.Mobile)===m);
 }
 function searchCustomersLocal(q){
-  q = (q||'').toLowerCase().trim();
-  if(!q) return [];
-  return STATE.customers.filter(c =>
-    (c['Customer ID']||'').toLowerCase().includes(q) ||
-    (c['Farmer Name']||'').toLowerCase().includes(q) ||
-    (c.Mobile||'').includes(q) ||
-    (c['Farm Name']||'').toLowerCase().includes(q) ||
-    (c.Village||'').toLowerCase().includes(q)
+  q=normalizeText(q); if(!q) return [];
+  const digits=normalizeMobile(q);
+  return STATE.customers.filter(c=>
+    normalizeText(c['Customer ID']).includes(q) ||
+    normalizeText(c['Farmer Name']).includes(q) ||
+    (digits.length>=4 && normalizeMobile(c.Mobile).includes(digits)) ||
+    normalizeText(c['Farm Name']).includes(q) ||
+    normalizeText(c.Village).includes(q) ||
+    normalizeText(c.Taluk).includes(q) ||
+    normalizeText(c.District).includes(q)
   ).slice(0,8);
 }
 
@@ -1827,6 +1866,11 @@ function renderCustomerSearchBox(inputId, resultsId, onSelect){
   const input = document.getElementById(inputId);
   const resultsBox = document.getElementById(resultsId);
   input.addEventListener('input', debounce(function(){
+    // Any manual edit invalidates the previously selected customer until a new result is chosen.
+    if(resultsBox.dataset.selectedId && input.value.trim() !== resultsBox.dataset.selectedDisplay){
+      resultsBox.dataset.selectedId='';
+      onSelect(null);
+    }
     const q = input.value.trim();
     if(q.length < 2){ resultsBox.innerHTML=''; return; }
     const matches = searchCustomersLocal(q);
@@ -1840,7 +1884,10 @@ function renderCustomerSearchBox(inputId, resultsId, onSelect){
     resultsBox.querySelectorAll('.cust-result').forEach(el=>{
       el.addEventListener('click', ()=>{
         const cust = STATE.customers.find(c=>c['Customer ID']===el.dataset.id);
+        if(!cust) return;
         input.value = cust['Farmer Name'] + ' (' + cust.Mobile + ')';
+        resultsBox.dataset.selectedId=cust['Customer ID']||'';
+        resultsBox.dataset.selectedDisplay=input.value;
         resultsBox.innerHTML='';
         onSelect(cust);
       });
@@ -1939,8 +1986,8 @@ document.getElementById('farmerForm').addEventListener('submit', async function(
     setVal('fm_customerId','');
   } else {
     upsertLocalCustomer(record);
-    queuePendingSync('customer', record);
-    toast('Unable to connect to Google Sheets. Your data has been preserved locally.', 'warn');
+    queuePendingSync(isUpdate ? 'customerUpdate' : 'customerCreate', record);
+    toast('Saved locally. Google Sheets sync is pending.', 'warn');
   }
 });
 function findCustomerById(id){ return STATE.customers.find(c=>c['Customer ID']===id); }
@@ -1971,7 +2018,7 @@ renderCustomerSearchBox('fr_customerSearch','fr_customerResults', c=>{
 });
 renderCustomerSearchBox('qb_customerSearch','qb_customerResults', c=>{
   selectedCustomerForQuote = c;
-  document.getElementById('qb_selectedCustomer').innerHTML = `<div class="badge badge-green">${escapeHtml(c['Farmer Name'])} — ${escapeHtml(c['Customer ID'])}</div>`;
+  document.getElementById('qb_selectedCustomer').innerHTML = c ? `<div class="badge badge-green">${escapeHtml(c['Farmer Name'])} — ${escapeHtml(c['Customer ID'])}</div>` : '';
 });
 document.getElementById('cr_goToCalcBtn').addEventListener('click', ()=>{
   if(!selectedCustomerForCR){ toast('Select a customer first','error'); return; }
@@ -3750,6 +3797,7 @@ async function initAppData(){
   loadDraft();
   renderPendingBanner();
   await refetchAllData();
+  if(getPendingQueue().length) await retrySync();
   startAutoSync();
 }
 
@@ -3759,43 +3807,79 @@ async function initAppData(){
    in-progress form fields (Farmer Registration, calculators, etc.),
    only the read-only list/table views and the Dashboard. */
 async function refetchAllData(){
-  const custRes = await apiGet('getCustomers', {});
-  if(custRes && custRes.success && Array.isArray(custRes.data)){
-    STATE.customers = custRes.data;
+  if(syncPromise) return syncPromise;
+  const myRevision=++syncRevision;
+  syncPromise=(async()=>{
+    const results=await Promise.allSettled([
+      apiGet('getCustomers',{}),
+      apiGet('getChicksEnquiries',{}),
+      apiGet('getFeedEnquiries',{}),
+      apiGet('getQuotations',{}),
+      apiGet('getHealthComplaints',{}),
+      apiGet('getProductPrices',{})
+    ]);
+    if(myRevision!==syncRevision) return;
+    const [custRes,chicksRes,feedRes,qtnRes,healthRes,priceRes]=results.map(r=>r.status==='fulfilled'?r.value:{success:false});
+
+    // Never discard locally queued writes while refreshing server data.
+    if(custRes.success && Array.isArray(custRes.data)) STATE.customers=mergeServerWithPending(custRes.data,'customer');
+    if(chicksRes.success && Array.isArray(chicksRes.data)) STATE.chicksEnquiries=mergeServerWithPending(chicksRes.data,'chicksEnquiry');
+    if(feedRes.success && Array.isArray(feedRes.data)) STATE.feedEnquiries=mergeServerWithPending(feedRes.data,'feedEnquiry');
+    if(qtnRes.success && Array.isArray(qtnRes.data)) STATE.allQuotations=mergeServerWithPending(qtnRes.data,'quotation');
+    if(healthRes.success && Array.isArray(healthRes.data)) STATE.healthComplaints=mergeServerWithPending(healthRes.data,'healthComplaint');
+
+    if(priceRes.success && Array.isArray(priceRes.data) && priceRes.data.length){
+      priceRes.data.forEach(row=>{
+        let match=FEED_PRODUCTS.find(p=>p.id===row['Product ID']);
+        if(!match){ match={id:row['Product ID']||uid('FP'),category:row.Category,product:row['Product Name'],stage:row['Stage']||'',bagWeight:Number(row['Bag Weight'])||0}; FEED_PRODUCTS.push(match); }
+        if(row['Stage']) match.stage=row['Stage'];
+        if(row['Current Price']!=null && row['Current Price']!=='') match.price=Number(row['Current Price']);
+        if(row['Last Updated']) match.updated=row['Last Updated'];
+      });
+    }
+    rebindSelectedCustomers();
+    renderFeedProductOptions(); renderDashboard();
+    if(document.getElementById('page-records').classList.contains('active')) renderRecordsTable();
+    if(document.getElementById('page-quotations').classList.contains('active')) renderQuotationList();
+    if(document.getElementById('page-health').classList.contains('active')) renderHealthComplaintsList();
+    if(document.getElementById('page-followups').classList.contains('active')) renderFollowupsPage();
+    const allResults=[custRes,chicksRes,feedRes,qtnRes,healthRes,priceRes];
+    const anySuccess=allResults.some(x=>x&&x.success);
+    const failedCount=allResults.filter(x=>!(x&&x.success)).length;
+    if(anySuccess) markSynced();
+    if(failedCount && anySuccess) updateConnPill(false);
+    return anySuccess;
+  })().finally(()=>{ syncPromise=null; });
+  return syncPromise;
+}
+
+function mergeServerWithPending(serverRows, family){
+  const rows=Array.isArray(serverRows)?serverRows.map(x=>Object.assign({},x)):[];
+  const keyFor=(r)=>r['Customer ID']||r['Quotation ID']||r['Complaint ID']||r['Enquiry ID'];
+  const pending=getPendingQueue();
+  const relevant=pending.filter(x=>{
+    if(family==='customer') return x.kind==='customerCreate'||x.kind==='customerUpdate'||x.kind==='customer'||x.kind==='deleteCustomer';
+    return x.kind===family || (family==='quotation' && (x.kind==='updateQuotationStatus'||x.kind==='quotationFields'));
+  });
+  for(const item of relevant){
+    const key=keyFor(item.record);
+    if(!key) continue;
+    let idx=rows.findIndex(r=>keyFor(r)===key);
+    if(item.kind==='deleteCustomer') { if(idx>=0) rows.splice(idx,1); continue; }
+    if(idx<0){ rows.push(Object.assign({},item.record)); continue; }
+    if(item.kind==='updateQuotationStatus'||item.kind==='quotationFields'||item.kind==='customerUpdate') rows[idx]=Object.assign({},rows[idx],item.record);
+    else rows[idx]=Object.assign({},rows[idx],item.record);
   }
-  const chicksRes = await apiGet('getChicksEnquiries', {});
-  if(chicksRes && chicksRes.success && Array.isArray(chicksRes.data)){
-    STATE.chicksEnquiries = chicksRes.data;
-  }
-  const feedRes = await apiGet('getFeedEnquiries', {});
-  if(feedRes && feedRes.success && Array.isArray(feedRes.data)){
-    STATE.feedEnquiries = feedRes.data;
-  }
-  const qtnRes = await apiGet('getQuotations', {});
-  if(qtnRes && qtnRes.success && Array.isArray(qtnRes.data)){
-    STATE.allQuotations = qtnRes.data;
-  }
-  const healthRes = await apiGet('getHealthComplaints', {});
-  if(healthRes && healthRes.success && Array.isArray(healthRes.data)){
-    STATE.healthComplaints = healthRes.data;
-  }
-  const priceRes = await apiGet('getProductPrices', {});
-  if(priceRes && priceRes.success && Array.isArray(priceRes.data) && priceRes.data.length){
-    priceRes.data.forEach(row=>{
-      let match = FEED_PRODUCTS.find(p=>p.id===row['Product ID']);
-      if(!match){ match = {id:row['Product ID']||uid('FP'), category:row.Category, product:row['Product Name'], stage:row['Stage']||'', bagWeight:Number(row['Bag Weight'])||0}; FEED_PRODUCTS.push(match); }
-      if(row['Stage']) match.stage = row['Stage'];
-      if(row['Current Price']) match.price = Number(row['Current Price']);
-      if(row['Last Updated']) match.updated = row['Last Updated'];
-    });
-  }
-  renderFeedProductOptions();
-  renderDashboard();
-  if(document.getElementById('page-records').classList.contains('active')) renderRecordsTable();
-  if(document.getElementById('page-quotations').classList.contains('active')) renderQuotationList();
-  if(document.getElementById('page-health').classList.contains('active')) renderHealthComplaintsList();
-  if(document.getElementById('page-followups').classList.contains('active')) renderFollowupsPage();
-  markSynced();
+  return rows;
+}
+
+function rebindSelectedCustomers(){
+  if(selectedCustomerForChicks && selectedCustomerForChicks['Customer ID']) selectedCustomerForChicks=findCustomerById(selectedCustomerForChicks['Customer ID'])||selectedCustomerForChicks;
+  if(selectedCustomerForFeed && selectedCustomerForFeed['Customer ID']) selectedCustomerForFeed=findCustomerById(selectedCustomerForFeed['Customer ID'])||selectedCustomerForFeed;
+  if(selectedCustomerForCR && selectedCustomerForCR['Customer ID']) selectedCustomerForCR=findCustomerById(selectedCustomerForCR['Customer ID'])||selectedCustomerForCR;
+  if(selectedCustomerForFR && selectedCustomerForFR['Customer ID']) selectedCustomerForFR=findCustomerById(selectedCustomerForFR['Customer ID'])||selectedCustomerForFR;
+  if(selectedCustomerForQuote && selectedCustomerForQuote['Customer ID']) selectedCustomerForQuote=findCustomerById(selectedCustomerForQuote['Customer ID'])||selectedCustomerForQuote;
+  if(typeof selectedCustomerForHealth!=='undefined' && selectedCustomerForHealth && selectedCustomerForHealth['Customer ID']) selectedCustomerForHealth=findCustomerById(selectedCustomerForHealth['Customer ID'])||selectedCustomerForHealth;
 }
 
 // How often the app quietly checks Google Sheets for changes made by
